@@ -1,7 +1,13 @@
 """
 app/streamlit_app.py — Zamesin AJTBD RAG Bot
 """
+import os
 import streamlit as st
+
+# Inject OPENAI_API_KEY from Streamlit secrets if available (Streamlit Cloud deployment)
+if "OPENAI_API_KEY" in st.secrets:
+    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+
 from rag import load_index, build_embeddings_if_needed, answer_stream
 
 st.set_page_config(page_title="AJTBD Ассистент", page_icon="🎯", layout="centered")
