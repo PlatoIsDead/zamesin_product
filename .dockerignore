@@ -1,0 +1,13 @@
+.env
+.env.*
+*:Zone.Identifier
+*.Zone.Identifier
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+README.md
+data/embeddings_cache.npy
+.streamlit/
+.claude/

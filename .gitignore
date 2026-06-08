@@ -3,5 +3,5 @@ __pycache__/
 *.pyc
 *.pyc:Zone.Identifier
 *:Zone.Identifier
-data/embeddings_cache.npy
 .streamlit/
+TASK.md

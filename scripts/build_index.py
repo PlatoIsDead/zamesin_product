@@ -1,7 +1,8 @@
 """
 scripts/build_index.py
-Parses markdown lecture files → chunks → embeds via sentence-transformers → saves cache.
+Parses markdown lecture files → chunks → embeds via OpenAI text-embedding-3-small → saves cache.
 Run once: python scripts/build_index.py
+Requires OPENAI_API_KEY in .env
 """
 
 import json
@@ -17,14 +18,17 @@ INDEX_DIR       = os.path.join(DATA_DIR, "zamezin_indexed")
 CHUNKS_PATH     = os.path.join(DATA_DIR, "chunks_cache.json")
 EMBEDDINGS_PATH = os.path.join(DATA_DIR, "embeddings_cache.npy")
 
-EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-BATCH_SIZE  = 64
+EMBED_MODEL = "text-embedding-3-small"
+BATCH_SIZE  = 100
 
 PARTS = [
     ("PART1", "PART1_annotations.md", "PART1_osnovy.md",      "Основы AJTBD"),
     ("PART2", "PART2_annotations.md", "PART2_cennost.md",     "Ценность продукта"),
     ("PART3", "PART3_annotations.md", "PART3_zapusk.md",      "Запуск и сегменты"),
     ("PART4", "PART4_annotations.md", "PART4_strategiya.md",  "Стратегия"),
+    # transcript paths with ../  are relative to INDEX_DIR, resolving into DATA_DIR
+    ("PART5", "PART5_annotations.md", "../book_zamesin.txt",  "Книга AJTBD"),
+    ("PART6", "PART6_annotations.md", "../cases_zamesin.txt", "Кейсы AJTBD"),
 ]
 
 CHUNK_SIZE = 600  # approx tokens (chars / 4)
@@ -34,11 +38,11 @@ def parse_annotations(path: str, part_id: str, part_title: str) -> list[dict]:
     with open(path, encoding="utf-8") as f:
         content = f.read()
 
-    sections = re.split(r"(?=^## Лекция)", content, flags=re.MULTILINE)
+    sections = re.split(r"(?=^## (?:Лекция|Глава|Кейс))", content, flags=re.MULTILINE)
     chunks = []
     for sec in sections:
         sec = sec.strip()
-        if not sec.startswith("## Лекция"):
+        if not re.match(r"^## (?:Лекция|Глава|Кейс)", sec):
             continue
         title = sec.splitlines()[0].lstrip("#").strip()
         chunks.append({
@@ -89,21 +93,20 @@ def parse_transcript(path: str, part_id: str, part_title: str) -> list[dict]:
 
 
 def embed_chunks(chunks: list[dict]) -> np.ndarray:
-    from sentence_transformers import SentenceTransformer
-    print(f"Loading embedding model: {EMBED_MODEL}")
-    model = SentenceTransformer(EMBED_MODEL)
+    from openai import OpenAI
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-    # Use first 512 chars for embedding (model max tokens)
-    texts = [c["text"][:512].strip() or "пустой фрагмент" for c in chunks]
-    print(f"Embedding {len(texts)} chunks (batch={BATCH_SIZE})...")
+    texts = [c["text"][:6000].strip() or "пустой фрагмент" for c in chunks]
+    print(f"Embedding {len(texts)} chunks via OpenAI {EMBED_MODEL} (batch={BATCH_SIZE})...")
 
-    embeddings = model.encode(
-        texts,
-        batch_size=BATCH_SIZE,
-        show_progress_bar=True,
-        convert_to_numpy=True,
-    )
-    return embeddings.astype(np.float32)
+    all_embs = []
+    for i in range(0, len(texts), BATCH_SIZE):
+        batch = texts[i:i + BATCH_SIZE]
+        resp = client.embeddings.create(model=EMBED_MODEL, input=batch)
+        all_embs.extend([d.embedding for d in resp.data])
+        print(f"  {min(i + BATCH_SIZE, len(texts))}/{len(texts)}")
+
+    return np.array(all_embs, dtype=np.float32)
 
 
 def build_index():
