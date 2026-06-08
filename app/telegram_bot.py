@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -40,6 +40,15 @@ logger.info("Index ready: %d chunks", len(CHUNKS))
 # ---------------------------------------------------------------------------
 # Settings schema
 # ---------------------------------------------------------------------------
+STARTERS = ReplyKeyboardMarkup(
+    [
+        ["Что такое граф работ?", "Как провести AJTBD-интервью?"],
+        ["Как создать ценность продукта?", "Покажи реальный кейс AJTBD"],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Задай вопрос или выбери тему...",
+)
+
 PARTS = {
     "all":   (None,    "Все части"),
     "PART1": ("PART1", "PART1 — Основы"),
@@ -88,11 +97,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = get_settings(context)
     await update.message.reply_html(
         "👋 <b>Привет!</b> Я ассистент по курсу <b>Advanced Jobs To Be Done</b> Ильи Замезина.\n\n"
-        "Просто напиши свой вопрос — я отвечу, опираясь на материалы курса.\n\n"
+        "Задавай вопросы по курсу — отвечаю строго по материалам лекций, книги и кейсов.\n\n"
         "<b>Команды:</b>\n"
         "/part — выбрать часть курса\n"
         f"/length — длина ответа (сейчас: <b>{s['length']}</b>)\n"
-        "/help — справка"
+        "/help — справка",
+        reply_markup=STARTERS,
     )
 
 
