@@ -8,6 +8,7 @@ import os
 import numpy as np
 from openai import OpenAI
 from dotenv import load_dotenv
+from rank_bm25 import BM25Okapi
 
 load_dotenv()
 
@@ -40,7 +41,9 @@ def load_index():
     with open(CHUNKS_PATH, "r", encoding="utf-8") as f:
         chunks = json.load(f)
     embeddings = np.load(EMBEDDINGS_PATH)
-    return chunks, embeddings
+    tokenized = [c["text"].lower().split() for c in chunks]
+    bm25 = BM25Okapi(tokenized)
+    return chunks, embeddings, bm25
 
 
 def build_embeddings_if_needed():
@@ -76,21 +79,28 @@ def embed_query(text: str) -> np.ndarray:
     return np.array(resp.data[0].embedding, dtype=np.float32)
 
 
-def retrieve(query, chunks, embeddings, part_filter, top_k=5):
+def retrieve(query, chunks, embeddings, bm25, part_filter, top_k=5, alpha=0.6):
     qvec = embed_query(query)
-    scores = cosine_sim(qvec, embeddings)
+    vector_scores = cosine_sim(qvec, embeddings)
+    bm25_scores = np.array(bm25.get_scores(query.lower().split()), dtype=np.float32)
 
-    if part_filter and part_filter != "Все":
+    def norm(x):
+        r = x.max() - x.min()
+        return (x - x.min()) / (r + 1e-9)
+
+    combined = alpha * norm(vector_scores) + (1 - alpha) * norm(bm25_scores)
+
+    if part_filter:
         mask = np.array([1.0 if c["part"] == part_filter else 0.0 for c in chunks])
-        scores = scores * mask
+        combined = combined * mask
 
-    top = np.argsort(scores)[::-1][:top_k]
-    return [{**chunks[i], "score": float(scores[i])} for i in top if scores[i] > 0.01]
+    top = np.argsort(combined)[::-1][:top_k]
+    return [{**chunks[i], "score": float(combined[i])} for i in top if combined[i] > 0.01]
 
 
-def answer_stream(query, chunks, embeddings, part_filter, answer_length):
+def answer_stream(query, chunks, embeddings, bm25, part_filter, answer_length):
     """Generator: yields text tokens, then (None, relevant) as final sentinel."""
-    relevant = retrieve(query, chunks, embeddings, part_filter)
+    relevant = retrieve(query, chunks, embeddings, bm25, part_filter)
 
     if not relevant:
         yield "Не найдено релевантных фрагментов."
@@ -102,18 +112,25 @@ def answer_stream(query, chunks, embeddings, part_filter, answer_length):
         for c in relevant
     )
 
+    if isinstance(answer_length, int):
+        hint = f"Ответ — не более {answer_length} токенов."
+        max_tok = answer_length
+    else:
+        hint = LENGTH_HINT.get(answer_length, "")
+        max_tok = LENGTH_TOKENS.get(answer_length, 400)
+
     client = _client()
     stream = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": (
-                f"{LENGTH_HINT.get(answer_length, '')}\n\n"
+                f"{hint}\n\n"
                 f"Фрагменты лекций:\n{context}\n\n"
                 f"Вопрос: {query}"
             )},
         ],
-        max_tokens=LENGTH_TOKENS.get(answer_length, 400),
+        max_tokens=max_tok,
         temperature=0.2,
         stream=True,
     )

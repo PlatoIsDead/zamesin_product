@@ -11,12 +11,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -34,21 +33,32 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 logger.info("Loading RAG index…")
 build_embeddings_if_needed()
-CHUNKS, EMBEDDINGS = load_index()
+CHUNKS, EMBEDDINGS, BM25 = load_index()
 logger.info("Index ready: %d chunks", len(CHUNKS))
 
 # ---------------------------------------------------------------------------
-# Settings schema
+# Button constants
 # ---------------------------------------------------------------------------
-STARTERS = ReplyKeyboardMarkup(
-    [
-        ["Что такое граф работ?", "Как провести AJTBD-интервью?"],
-        ["Как создать ценность продукта?", "Покажи реальный кейс AJTBD"],
-    ],
-    resize_keyboard=True,
-    input_field_placeholder="Задай вопрос или выбери тему...",
-)
+BTN_SETTINGS   = "⚙️ Настройки"
+BTN_BACK       = "← Назад"
+BTN_LENGTH     = "📏 Длина ответа"
+BTN_PART       = "📚 Часть курса"
+BTN_LEN_CUSTOM = "✏️ Свой лимит токенов"
 
+PART_BUTTONS = {
+    "Все части":         "all",
+    "PART1 — Основы":    "PART1",
+    "PART2 — Ценность":  "PART2",
+    "PART3 — Запуск":    "PART3",
+    "PART4 — Стратегия": "PART4",
+    "PART5 — Книга":     "PART5",
+    "PART6 — Кейсы":     "PART6",
+}
+LENGTH_BUTTONS = {"Коротко", "Стандартно", "Подробно"}
+
+# ---------------------------------------------------------------------------
+# Parts metadata
+# ---------------------------------------------------------------------------
 PARTS = {
     "all":   (None,    "Все части"),
     "PART1": ("PART1", "PART1 — Основы"),
@@ -58,115 +68,172 @@ PARTS = {
     "PART5": ("PART5", "PART5 — Книга"),
     "PART6": ("PART6", "PART6 — Кейсы"),
 }
-LENGTHS = ["Коротко", "Стандартно", "Подробно"]
+
 DEFAULT_SETTINGS = {"part": "all", "length": "Подробно"}
 
-
+# ---------------------------------------------------------------------------
+# Settings & state helpers
+# ---------------------------------------------------------------------------
 def get_settings(context: ContextTypes.DEFAULT_TYPE) -> dict:
     if "settings" not in context.user_data:
         context.user_data["settings"] = dict(DEFAULT_SETTINGS)
     return context.user_data["settings"]
 
 
+def get_menu_state(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return context.user_data.get("menu_state", "main")
+
+
+def set_menu_state(context: ContextTypes.DEFAULT_TYPE, state: str):
+    context.user_data["menu_state"] = state
+
+
 # ---------------------------------------------------------------------------
 # Keyboard builders
 # ---------------------------------------------------------------------------
-def _part_keyboard(current: str) -> InlineKeyboardMarkup:
-    rows = []
-    for key, (_, label) in PARTS.items():
-        marker = "✅ " if key == current else ""
-        rows.append([InlineKeyboardButton(marker + label, callback_data=f"part:{key}")])
-    return InlineKeyboardMarkup(rows)
+def _kb_main() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["Что такое граф работ?", "Как провести AJTBD-интервью?"],
+            ["Как создать ценность продукта?", "Покажи реальный кейс AJTBD"],
+            [BTN_SETTINGS],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Задай вопрос или выбери тему...",
+    )
 
 
-def _length_keyboard(current: str) -> InlineKeyboardMarkup:
-    buttons = [
-        InlineKeyboardButton(
-            ("✅ " if l == current else "") + l,
-            callback_data=f"length:{l}",
-        )
-        for l in LENGTHS
-    ]
-    return InlineKeyboardMarkup([buttons])
+def _kb_settings() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[BTN_LENGTH, BTN_PART], [BTN_BACK]],
+        resize_keyboard=True,
+    )
+
+
+def _kb_length() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [["Коротко", "Стандартно", "Подробно"], [BTN_LEN_CUSTOM], [BTN_BACK]],
+        resize_keyboard=True,
+    )
+
+
+def _kb_part() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["Все части"],
+            ["PART1 — Основы", "PART2 — Ценность"],
+            ["PART3 — Запуск", "PART4 — Стратегия"],
+            ["PART5 — Книга", "PART6 — Кейсы"],
+            [BTN_BACK],
+        ],
+        resize_keyboard=True,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = get_settings(context)
+    set_menu_state(context, "main")
     await update.message.reply_html(
         "👋 <b>Привет!</b> Я ассистент по курсу <b>Advanced Jobs To Be Done</b> Ильи Замезина.\n\n"
         "Задавай вопросы по курсу — отвечаю строго по материалам лекций, книги и кейсов.\n\n"
-        "<b>Команды:</b>\n"
-        "/part — выбрать часть курса\n"
-        f"/length — длина ответа (сейчас: <b>{s['length']}</b>)\n"
-        "/help — справка",
-        reply_markup=STARTERS,
+        "Настройки (длина ответа, часть курса) — кнопка ⚙️ Настройки внизу.",
+        reply_markup=_kb_main(),
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = get_settings(context)
     part_label = PARTS[s["part"]][1]
+    length_label = str(s["length"]) + (" токенов" if isinstance(s["length"], int) else "")
     await update.message.reply_html(
         "📚 <b>AJTBD Ассистент</b>\n\n"
         "Задавай вопросы по курсу AJTBD Ильи Замезина — отвечаю строго по материалам.\n\n"
         "<b>Текущие настройки:</b>\n"
         f"• Часть курса: {part_label}\n"
-        f"• Длина ответа: {s['length']}\n\n"
-        "/part — сменить часть курса\n"
-        "/length — сменить длину ответа"
+        f"• Длина ответа: {length_label}\n\n"
+        "Изменить настройки — кнопка ⚙️ Настройки.",
+        reply_markup=_kb_main(),
     )
 
 
-async def cmd_part(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = get_settings(context)
-    await update.message.reply_text("Выбери часть курса:", reply_markup=_part_keyboard(s["part"]))
-
-
-async def cmd_length(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = get_settings(context)
-    await update.message.reply_text("Выбери длину ответа:", reply_markup=_length_keyboard(s["length"]))
-
-
 # ---------------------------------------------------------------------------
-# Inline button callbacks
-# ---------------------------------------------------------------------------
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    s = get_settings(context)
-    data = query.data
-
-    if data.startswith("part:"):
-        key = data.split(":", 1)[1]
-        s["part"] = key
-        label = PARTS[key][1]
-        await query.edit_message_text(
-            f"✅ Часть курса: <b>{label}</b>",
-            parse_mode="HTML",
-            reply_markup=_part_keyboard(key),
-        )
-    elif data.startswith("length:"):
-        val = data.split(":", 1)[1]
-        s["length"] = val
-        await query.edit_message_text(
-            f"✅ Длина ответа: <b>{val}</b>",
-            parse_mode="HTML",
-            reply_markup=_length_keyboard(val),
-        )
-
-
-# ---------------------------------------------------------------------------
-# Message handler — main RAG flow
+# Message handler — navigation + RAG
 # ---------------------------------------------------------------------------
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    question = update.message.text.strip()
-    if not question:
+    text = update.message.text.strip()
+    if not text:
         return
 
+    state = get_menu_state(context)
     s = get_settings(context)
+
+    # --- Навигация ---
+    if text == BTN_SETTINGS:
+        set_menu_state(context, "settings")
+        await update.message.reply_text("Настройки:", reply_markup=_kb_settings())
+        return
+
+    if text == BTN_BACK:
+        parent = "main" if state in ("settings", "awaiting_custom_length") else "settings"
+        set_menu_state(context, parent)
+        kb = _kb_main() if parent == "main" else _kb_settings()
+        label = "Главное меню:" if parent == "main" else "Настройки:"
+        await update.message.reply_text(label, reply_markup=kb)
+        return
+
+    if text == BTN_LENGTH:
+        set_menu_state(context, "length")
+        cur = s["length"]
+        label = str(cur) + (" токенов" if isinstance(cur, int) else "")
+        await update.message.reply_text(f"Длина ответа (сейчас: {label}):", reply_markup=_kb_length())
+        return
+
+    if text == BTN_PART:
+        set_menu_state(context, "part")
+        await update.message.reply_text(
+            f"Часть курса (сейчас: {PARTS[s['part']][1]}):", reply_markup=_kb_part()
+        )
+        return
+
+    if text in LENGTH_BUTTONS:
+        s["length"] = text
+        set_menu_state(context, "settings")
+        await update.message.reply_text(f"✅ Длина ответа: {text}", reply_markup=_kb_settings())
+        return
+
+    if text == BTN_LEN_CUSTOM:
+        set_menu_state(context, "awaiting_custom_length")
+        await update.message.reply_text(
+            "Введи максимальное количество токенов (50–2000).\n\n"
+            "Токен ≈ 0.75 слова.\n"
+            "Пресеты: Коротко = 150, Стандартно = 400, Подробно = 800.",
+            reply_markup=_kb_length(),
+        )
+        return
+
+    if state == "awaiting_custom_length":
+        try:
+            n = int(text)
+            if 50 <= n <= 2000:
+                s["length"] = n
+                set_menu_state(context, "settings")
+                await update.message.reply_text(f"✅ Лимит: {n} токенов", reply_markup=_kb_settings())
+            else:
+                await update.message.reply_text("Число должно быть от 50 до 2000.")
+        except ValueError:
+            await update.message.reply_text("Введи целое число, например 300.")
+        return
+
+    if text in PART_BUTTONS:
+        key = PART_BUTTONS[text]
+        s["part"] = key
+        set_menu_state(context, "settings")
+        await update.message.reply_text(f"✅ Часть курса: {text}", reply_markup=_kb_settings())
+        return
+
+    # --- RAG ---
     part_filter = PARTS[s["part"]][0]
     answer_length = s["length"]
 
@@ -177,9 +244,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         relevant = []
 
         for item in answer_stream(
-            query=question,
+            query=text,
             chunks=CHUNKS,
             embeddings=EMBEDDINGS,
+            bm25=BM25,
             part_filter=part_filter,
             answer_length=answer_length,
         ):
@@ -205,7 +273,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     except Exception:
-        logger.exception("Error answering question: %s", question)
+        logger.exception("Error answering question: %s", text)
         await thinking.edit_text("⚠️ Произошла ошибка при обработке запроса. Попробуй ещё раз.")
 
 
@@ -220,9 +288,6 @@ def main():
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("part", cmd_part))
-    app.add_handler(CommandHandler("length", cmd_length))
-    app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
     logger.info("Bot polling started")
