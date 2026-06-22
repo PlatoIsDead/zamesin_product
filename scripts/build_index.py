@@ -8,6 +8,7 @@ Requires OPENAI_API_KEY in .env
 import json
 import os
 import re
+import sys
 import numpy as np
 from dotenv import load_dotenv
 
@@ -46,13 +47,76 @@ def parse_annotations(path: str, part_id: str, part_title: str) -> list[dict]:
             continue
         title = sec.splitlines()[0].lstrip("#").strip()
         chunks.append({
-            "type":       "annotation",
-            "part":       part_id,
-            "part_title": part_title,
-            "lecture":    title,
-            "text":       sec,
+            "type":           "annotation",
+            "part":           part_id,
+            "part_title":     part_title,
+            "lecture":        title,
+            "lecture_minute": None,
+            "text":           sec,
         })
     return chunks
+
+
+def parse_lecture_meta(path: str) -> list[dict]:
+    """Упорядоченный список лекций/глав/кейсов части: title + duration_min.
+
+    duration_min = None, если у секции нет поля «Продолжительность» (книга/кейсы).
+    Порядок секций совпадает с порядком в исходном транскрипте части.
+    """
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+
+    sections = re.split(r"(?=^## (?:Лекция|Глава|Кейс))", content, flags=re.MULTILINE)
+    out = []
+    for sec in sections:
+        sec = sec.strip()
+        if not re.match(r"^## (?:Лекция|Глава|Кейс)", sec):
+            continue
+        title = sec.splitlines()[0].lstrip("#").strip()
+        m = re.search(r"Продолжительность.*?(\d+)\s*мин", sec)
+        out.append({"title": title, "duration_min": int(m.group(1)) if m else None})
+    return out
+
+
+def assign_lecture_minutes(all_chunks: list[dict], part_id: str, lectures: list[dict]):
+    """Назначает transcript-чанкам части `lecture` и `lecture_minute` грубой оценкой.
+
+    Позиция чанка в части (его порядковый индекс среди transcript-чанков) трактуется как доля
+    пройденного времени. Для видео-лекций (есть длительности) минута = доля × суммарную
+    длительность части минус начало лекции. Для книги/кейсов (длительностей нет) секция
+    назначается равными весами, минута не считается (None).
+    """
+    if not lectures:
+        return
+    tchunks = [c for c in all_chunks if c["part"] == part_id and c["type"] == "transcript"]
+    n = len(tchunks)
+    if n == 0:
+        return
+
+    durations = [lec["duration_min"] for lec in lectures]
+    has_durations = all(d is not None for d in durations)
+
+    if has_durations:
+        total = sum(durations)
+        starts, acc = [], 0
+        for d in durations:
+            starts.append(acc)
+            acc += d
+        for k, c in enumerate(tchunks):
+            elapsed = ((k + 0.5) / n) * total
+            # Reason: первая лекция, чей конец превышает elapsed_min
+            i = len(lectures) - 1
+            for j in range(len(lectures)):
+                if elapsed < starts[j] + durations[j]:
+                    i = j
+                    break
+            c["lecture"] = lectures[i]["title"]
+            c["lecture_minute"] = max(0, round(elapsed - starts[i]))
+    else:
+        for k, c in enumerate(tchunks):
+            i = min(int((k + 0.5) / n * len(lectures)), len(lectures) - 1)
+            c["lecture"] = lectures[i]["title"]
+            c["lecture_minute"] = None
 
 
 def chunk_text(text: str, part_id: str, part_title: str) -> list[dict]:
@@ -65,11 +129,12 @@ def chunk_text(text: str, part_id: str, part_title: str) -> list[dict]:
         t = " ".join(buffer).strip()
         if len(t) > 100:
             chunks.append({
-                "type":       "transcript",
-                "part":       part_id,
-                "part_title": part_title,
-                "lecture":    "",
-                "text":       t,
+                "type":           "transcript",
+                "part":           part_id,
+                "part_title":     part_title,
+                "lecture":        "",
+                "lecture_minute": None,
+                "text":           t,
             })
 
     for sent in sentences:
@@ -131,6 +196,15 @@ def build_index():
         else:
             print(f"  WARN: {transcript_file} not found")
 
+        # Назначить transcript-чанкам части лекцию + грубую минуту по аннотациям
+        if os.path.exists(ann_path):
+            lectures = parse_lecture_meta(ann_path)
+            assign_lecture_minutes(all_chunks, part_id, lectures)
+            tagged = sum(1 for c in all_chunks
+                         if c["part"] == part_id and c["type"] == "transcript" and c["lecture"])
+            print(f"  {part_id}: размечено {tagged} transcript-чанков "
+                  f"({len(lectures)} секций, минуты={'да' if lectures and lectures[0]['duration_min'] else 'нет'})")
+
     for i, c in enumerate(all_chunks):
         c["id"] = i
 
@@ -140,10 +214,24 @@ def build_index():
         json.dump(all_chunks, f, ensure_ascii=False, indent=2)
     print(f"Chunks saved: {CHUNKS_PATH}")
 
-    embeddings = embed_chunks(all_chunks)
-    np.save(EMBEDDINGS_PATH, embeddings)
-    print(f"Embeddings saved: {EMBEDDINGS_PATH} — shape: {embeddings.shape}")
-    print("\nDone! Run: streamlit run app/streamlit_app.py")
+    # Reason: текст чанков не изменился → переиспользуем эмбеддинги, если их число совпадает.
+    # Пересборка только по флагу --force-embed или при рассинхроне count.
+    force = "--force-embed" in sys.argv
+    embeddings = None
+    if not force and os.path.exists(EMBEDDINGS_PATH):
+        existing = np.load(EMBEDDINGS_PATH)
+        if existing.shape[0] == len(all_chunks):
+            print(f"Reusing existing embeddings {existing.shape} — chunk count matches, skipping re-embed.")
+            embeddings = existing
+        else:
+            print(f"WARN: embeddings rows {existing.shape[0]} != chunks {len(all_chunks)} → пере-эмбеддинг.")
+
+    if embeddings is None:
+        embeddings = embed_chunks(all_chunks)
+        np.save(EMBEDDINGS_PATH, embeddings)
+        print(f"Embeddings saved: {EMBEDDINGS_PATH} — shape: {embeddings.shape}")
+
+    print("\nDone! Запусти бота: python app/telegram_bot.py")
 
 
 if __name__ == "__main__":

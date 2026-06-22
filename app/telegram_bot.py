@@ -20,7 +20,15 @@ from telegram.ext import (
     filters,
 )
 
-from rag import load_index, build_embeddings_if_needed, answer_stream
+from rag import (
+    load_index,
+    build_embeddings_if_needed,
+    answer_stream,
+    rewrite_query,
+    try_meta_answer,
+    format_citation,
+    HISTORY_MAX_MSGS,
+)
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -236,10 +244,20 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- RAG ---
     part_filter = PARTS[s["part"]][0]
     answer_length = s["length"]
+    hist = context.user_data.setdefault("history", [])
+
+    # P7: детерминированный ответ на мета-вопросы о структуре базы — до векторного поиска
+    meta = try_meta_answer(text, CHUNKS)
+    if meta:
+        await update.message.reply_text(meta)
+        return
 
     thinking = await update.message.reply_text("🔍 Ищу ответ…")
 
     try:
+        # P1/P2/P4: переформулировка с учётом истории (история без текущего сообщения)
+        search_query = rewrite_query(hist, text)
+
         full_text = ""
         relevant = []
 
@@ -250,27 +268,26 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bm25=BM25,
             part_filter=part_filter,
             answer_length=answer_length,
+            history=hist,
+            search_query=search_query,
         ):
             if isinstance(item, tuple):
                 _, relevant = item
                 break
             full_text += item
 
-        await thinking.edit_text(full_text or "Не удалось получить ответ.")
-
+        # Одна строка-цитата (лекция + минута) прямо в ответе — вместо блока «Источники»
+        answer = full_text or "Не удалось получить ответ."
         if relevant:
-            lines = []
-            for c in relevant[:4]:
-                title = c.get("part_title", "")
-                lecture = c.get("lecture", "")
-                score = c["score"]
-                preview = c["text"][:150].replace("\n", " ")
-                header = f"<b>{title}</b>" + (f" | {lecture}" if lecture else "")
-                lines.append(f"📎 {header} (схожесть: {score:.2f})\n<i>{preview}…</i>")
+            citation = format_citation(relevant[0])
+            if citation:
+                answer = f"{answer}\n\n{citation}"
+        await thinking.edit_text(answer)
 
-            await update.message.reply_html(
-                "📚 <b>Источники:</b>\n\n" + "\n\n".join(lines)
-            )
+        # P1: сохраняем реплики в историю и обрезаем до последних HISTORY_MAX_MSGS
+        hist.append({"role": "user", "content": text[:1500]})
+        hist.append({"role": "assistant", "content": full_text[:600]})
+        del hist[:-HISTORY_MAX_MSGS]
 
     except Exception:
         logger.exception("Error answering question: %s", text)
