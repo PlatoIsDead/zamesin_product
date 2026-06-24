@@ -10,3 +10,6 @@ TASK.md
 PLANNING.md
 CLAUDE.md
 INITIAL.md
+PRPs/
+.claude/
+.pytest_cache/

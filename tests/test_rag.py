@@ -29,12 +29,20 @@ def _make_index():
     return chunks, embeddings, bm25
 
 
-def _make_cases(n=11):
-    return [
+def _make_cases(n_titles=25, n_annot=11):
+    # n_titles реальных кейсов (транскрипты с описательными заголовками)
+    # + n_annot курируемых аннотаций «Кейс N — …» (summary только для первых кейсов).
+    transcripts = [
+        {"part": "PART6", "part_title": "Кейсы AJTBD", "type": "transcript",
+         "lecture": f"Кейс-история {i}", "text": f"Тело кейса {i}.", "id": 1000 + i}
+        for i in range(1, n_titles + 1)
+    ]
+    annotations = [
         {"part": "PART6", "part_title": "Кейсы AJTBD", "type": "annotation",
          "lecture": f"Кейс {i} — Компания {i}", "text": f"Полный текст кейса {i}.", "id": i}
-        for i in range(1, n + 1)
+        for i in range(1, n_annot + 1)
     ]
+    return transcripts + annotations
 
 
 # ---------------------------------------------------------------------------
@@ -75,29 +83,59 @@ def test_rank_and_filter_empty_when_nothing_passes(monkeypatch):
     assert out == []
 
 
+def test_rrf_prefers_doc_ranked_high_by_both(monkeypatch):
+    # RRF-свойство: документ, высокий и по dense, и по BM25, обходит высоких лишь по одному.
+    monkeypatch.setattr(rag, "MIN_COSINE", 0.0)  # без отсечки — проверяем чистый порядок
+    chunks = [
+        {"part": "P", "part_title": "", "type": "transcript", "lecture": "",
+         "text": "alpha beta gamma delta", "id": 0},   # высокий cos + высокий BM25
+        {"part": "P", "part_title": "", "type": "transcript", "lecture": "",
+         "text": "epsilon zeta eta", "id": 1},          # высокий cos, нулевой BM25
+        {"part": "P", "part_title": "", "type": "transcript", "lecture": "",
+         "text": "alpha theta", "id": 2},               # низкий cos, средний BM25
+    ]
+    embeddings = np.array([[1.0, 0.0, 0.0], [0.95, 0.05, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+    bm25 = BM25Okapi([c["text"].lower().split() for c in chunks])
+    qvec = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+    out = rag.rank_and_filter(qvec, chunks, embeddings, bm25,
+                              query="alpha beta gamma", part_filter=None)
+    assert out[0]["id"] == 0  # высок по обоим ретриверам → первый по RRF
+
+
 # ---------------------------------------------------------------------------
 # P7 — try_meta_answer
 # ---------------------------------------------------------------------------
 def test_meta_count_cases():
-    out = rag.try_meta_answer("Сколько всего кейсов?", _make_cases(11))
+    # Считаем реальные кейсы (25 транскриптов), а не отставшие аннотации (11).
+    out = rag.try_meta_answer("Сколько всего кейсов?", _make_cases())
     assert out is not None
-    assert "11" in out
-    assert "Кейс 8 — Компания 8" in out
+    assert "25" in out
+    assert "Кейс-история 8" in out
 
 
-def test_meta_give_case_n():
-    out = rag.try_meta_answer("Дай кейс 8", _make_cases(11))
+def test_meta_give_case_n_uses_annotation():
+    # Для первых 11 кейсов есть курируемая аннотация — отдаём её текст.
+    out = rag.try_meta_answer("Дай кейс 8", _make_cases())
     assert out == "Полный текст кейса 8."
 
 
+def test_meta_give_case_n_without_annotation():
+    # Кейс 15 есть в базе (25), но без аннотации — отдаём заголовок.
+    out = rag.try_meta_answer("Дай кейс 15", _make_cases())
+    assert out is not None
+    assert "Кейс-история 15" in out
+
+
 def test_meta_give_case_n_not_found():
-    out = rag.try_meta_answer("Дай кейс 99", _make_cases(11))
+    out = rag.try_meta_answer("Дай кейс 99", _make_cases())
     assert out is not None
     assert "99" in out
+    assert "25" in out
 
 
 def test_meta_list_parts():
-    chunks = _make_cases(2) + [
+    chunks = _make_cases(n_titles=2, n_annot=2) + [
         {"part": "PART1", "part_title": "Основы AJTBD", "type": "transcript",
          "lecture": "", "text": "...", "id": 100},
     ]
@@ -108,7 +146,7 @@ def test_meta_list_parts():
 
 
 def test_meta_returns_none_for_normal_question():
-    out = rag.try_meta_answer("Что такое ценность продукта?", _make_cases(11))
+    out = rag.try_meta_answer("Что такое ценность продукта?", _make_cases())
     assert out is None
 
 
